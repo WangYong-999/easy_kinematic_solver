@@ -1,173 +1,442 @@
 """
-Franka FR3 Robot FK/IK Solver using MuJoCo and Mink
+Franka FR3 FK/IK solver with pluggable IK backends.
+
+Three backends share one ``(xyz, quat[w,x,y,z]) -> q[7]`` IK interface and
+one ``q[7] -> (xyz, quat[w,x,y,z])`` FK interface:
+
+* ``mink``    — mink's QP-based IK with a FrameTask + PostureTask.
+* ``dls``     — damped least-squares (Levenberg-Marquardt), ported from
+                ``dexsimbench.dexsimbench.env.SimEnv._solve_eef_ik``.
+* ``opspace`` — wraps ``dexjoco.sim.controllers.opspace.opspace`` by
+                running its torque output into a scratch ``MjData`` via
+                ``qfrc_applied`` + ``mj_step`` until pose error settles.
+
+Backend imports are lazy: only the chosen backend's third-party module
+needs to be installed. ``mujoco`` is always required.
 """
+
+from __future__ import annotations
+
+from typing import Optional, Tuple
 
 import numpy as np
 import mujoco
-import mink
 from scipy.spatial.transform import Rotation as R
 
 
-class FrankaKinematicsSolver:
-    def __init__(self, model_path: str, end_site_name: str = "end"):
-        """
-        Initialize Franka kinematics solver.
+def _xmat_to_quat_wxyz(xmat: np.ndarray) -> np.ndarray:
+    """Convert a 3x3 rotation matrix to a mujoco-style [w, x, y, z] quat."""
+    quat_xyzw = R.from_matrix(xmat).as_quat()
+    return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
 
-        Args:
-            model_path: Path to the MuJoCo XML model file
-            end_site_name: Name of the end-effector site in the model
-        """
+
+def _quat_wxyz_to_matrix(quat_wxyz: np.ndarray) -> np.ndarray:
+    q = np.asarray(quat_wxyz, dtype=np.float64)
+    quat_xyzw = np.array([q[1], q[2], q[3], q[0]])
+    return R.from_quat(quat_xyzw).as_matrix()
+
+
+class FrankaKinematicsSolver:
+    """FK/IK wrapper around a standalone Franka MJCF, with multi-backend IK.
+
+    The solver owns one ``MjModel`` / ``MjData`` pair. FK and IK both
+    operate on that scratch data, so consecutive IK calls warm-start
+    against the previous solution unless ``q_init`` is passed explicitly.
+    """
+
+    SUPPORTED = ("mink", "dls", "opspace")
+
+    def __init__(
+        self,
+        model_path: str,
+        end_site_name: str = "end",
+        solver: str = "mink",
+        **solver_kwargs,
+    ):
+        if solver not in self.SUPPORTED:
+            raise ValueError(
+                f"Unknown solver '{solver}'. Supported: {self.SUPPORTED}"
+            )
+
         self.model_path = model_path
         self.end_site_name = end_site_name
+        self.solver = solver
 
-        # Load MuJoCo model
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.data = mujoco.MjData(self.model)
 
-        # Setup Mink configuration for IK
-        self.configuration = mink.Configuration(self.model)
-
-        # Get site ID for forward kinematics
         self.end_site_id = mujoco.mj_name2id(
-            self.model,
-            mujoco.mjtObj.mjOBJ_SITE,
-            end_site_name
+            self.model, mujoco.mjtObj.mjOBJ_SITE, end_site_name
         )
-
         if self.end_site_id < 0:
             raise ValueError(f"Site '{end_site_name}' not found in model")
+        self.end_body_id = int(self.model.site_bodyid[self.end_site_id])
 
-        # Setup IK tasks
+        # 7-DOF arm assumption: first seven hinge joints drive the arm.
+        # The standalone fr3v2 MJCF used by this solver has exactly seven
+        # 1-DOF joints in the kinematic chain, so qpos[:7] / qvel[:7] is
+        # the arm subspace.
+        self._qpos_adr = np.arange(7, dtype=int)
+        self._qvel_adr = np.arange(7, dtype=int)
+
+        # Backend-specific setup
+        if solver == "mink":
+            self._init_mink(**solver_kwargs)
+        elif solver == "dls":
+            self._init_dls(**solver_kwargs)
+        elif solver == "opspace":
+            self._init_opspace(**solver_kwargs)
+
+    # ------------------------------------------------------------------
+    # Backend init
+    # ------------------------------------------------------------------
+
+    def _init_mink(self, position_cost: float = 1.0,
+                   orientation_cost: float = 0.01,
+                   posture_cost: float = 1e-8,
+                   lm_damping: float = 0.5,
+                   ik_solver: str = "daqp",
+                   damping: float = 1e-12,
+                   **_unused):
+        import mink  # lazy
+        self._mink = mink
+        self.configuration = mink.Configuration(self.model)
         self.end_task = mink.FrameTask(
-            frame_name=end_site_name,
+            frame_name=self.end_site_name,
             frame_type="site",
-            position_cost=1.0,
-            orientation_cost=0.01,
-            lm_damping=0.5,
+            position_cost=position_cost,
+            orientation_cost=orientation_cost,
+            lm_damping=lm_damping,
         )
-
-        self.posture_task = mink.PostureTask(model=self.model, cost=1e-8)
-
-        # Initialize posture task with neutral configuration
+        self.posture_task = mink.PostureTask(model=self.model, cost=posture_cost)
         mujoco.mj_resetData(self.model, self.data)
         self.configuration.update(self.data.qpos)
         self.posture_task.set_target_from_configuration(self.configuration)
+        self._mink_ik_solver = ik_solver
+        self._mink_damping = damping
 
-        self.ik_solver = "daqp"
-        self.damping = 1e-12
+    def _init_dls(self, damping: float = 0.05,
+                  pos_step_max: float = 0.05,
+                  rot_step_max: float = 0.5,
+                  **_unused):
+        # Ported defaults from env.SimEnv._solve_eef_ik. These constants
+        # keep the LM linearization valid even when the target is far
+        # from the current pose.
+        self._dls_damping = damping
+        self._dls_pos_step_max = pos_step_max
+        self._dls_rot_step_max = rot_step_max
 
-    def forward_kinematics(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Compute forward kinematics.
+    def _init_opspace(self,
+                      pos_gains=(200.0, 200.0, 200.0),
+                      ori_gains=(200.0, 200.0, 200.0),
+                      damping_ratio: float = 1.0,
+                      nullspace_stiffness: float = 0.5,
+                      **_unused):
+        # No external opspace import — the controller logic is inlined in
+        # `_opspace_torque` below using mujoco's built-in quat ops, so the
+        # solver has no third-party dep beyond mujoco/numpy/scipy.
+        self._ops_pos_gains = np.asarray(pos_gains, dtype=np.float64)
+        self._ops_ori_gains = np.asarray(ori_gains, dtype=np.float64)
+        self._ops_damping_ratio = damping_ratio
+        self._ops_nullspace_stiffness = nullspace_stiffness
 
-        Args:
-            q: Joint positions [7,] in radians
+    # ------------------------------------------------------------------
+    # Forward kinematics (shared)
+    # ------------------------------------------------------------------
 
-        Returns:
-            xyz: End-effector position [3,] in meters
-            quat: End-effector orientation quaternion [4,] as [w, x, y, z]
-        """
-        # Set joint positions
-        self.data.qpos[:7] = q
-
-        # Forward kinematics
+    def forward_kinematics(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Site "end" pose as ``(xyz, quat=[w, x, y, z])`` for joints ``q``."""
+        q = np.asarray(q, dtype=np.float64).reshape(-1)
+        self.data.qpos[self._qpos_adr] = q[:7]
         mujoco.mj_forward(self.model, self.data)
-
-        # Get site position
         xyz = self.data.site_xpos[self.end_site_id].copy()
-
-        # Get site orientation (rotation matrix)
         xmat = self.data.site_xmat[self.end_site_id].reshape(3, 3).copy()
-
-        # Convert rotation matrix to quaternion [w, x, y, z]
-        rot = R.from_matrix(xmat)
-        quat = rot.as_quat()  # Returns [x, y, z, w]
-        quat = np.array([quat[3], quat[0], quat[1], quat[2]])  # Convert to [w, x, y, z]
-
+        quat = _xmat_to_quat_wxyz(xmat)
         return xyz, quat
+
+    def get_joint_limits(self) -> Tuple[np.ndarray, np.ndarray]:
+        return (self.model.jnt_range[:7, 0].copy(),
+                self.model.jnt_range[:7, 1].copy())
+
+    # ------------------------------------------------------------------
+    # Inverse kinematics (dispatch)
+    # ------------------------------------------------------------------
 
     def inverse_kinematics(
         self,
         xyz: np.ndarray,
         quat: np.ndarray,
-        q_init: np.ndarray = None,
+        q_init: Optional[np.ndarray] = None,
         max_iterations: int = 100,
         dt: float = 0.01,
-        pos_threshold: float =1e-1,
-        ori_threshold: float = 1e-1
-    ) -> tuple[np.ndarray, bool]:
-        """
-        Compute inverse kinematics.
+        pos_threshold: float = 1e-3,
+        ori_threshold: float = 1e-2,
+    ) -> Tuple[np.ndarray, bool]:
+        """Solve for joint angles reaching pose ``(xyz, quat)``.
 
-        Args:
-            xyz: Target end-effector position [3,] in meters
-            quat: Target end-effector orientation quaternion [4,] as [w, x, y, z]
-            q_init: Initial joint configuration [7,]. If None, uses current configuration
-            max_iterations: Maximum number of IK iterations
-            dt: Integration time step
-            pos_threshold: Convergence tolerance for position error (meters)
-            ori_threshold: Convergence tolerance for orientation error (radians)
+        ``quat`` is mujoco-style ``[w, x, y, z]``. ``q_init`` (optional)
+        seeds the iterative solver; if None, the solver continues from
+        its scratch state (warm start).
 
-        Returns:
-            q: Joint positions [7,] in radians
-            success: Whether IK converged successfully
+        Returns ``(q[7], success)``. ``success`` reflects convergence
+        within the position and orientation thresholds.
         """
-        # Set initial configuration
+        xyz = np.asarray(xyz, dtype=np.float64).reshape(3)
+        quat = np.asarray(quat, dtype=np.float64).reshape(4)
+        if np.linalg.norm(quat) < 1e-9:
+            return self.data.qpos[self._qpos_adr].copy(), False
+
+        if self.solver == "mink":
+            return self._ik_mink(xyz, quat, q_init, max_iterations, dt,
+                                 pos_threshold, ori_threshold)
+        if self.solver == "dls":
+            return self._ik_dls(xyz, quat, q_init, max_iterations,
+                                pos_threshold, ori_threshold)
+        if self.solver == "opspace":
+            return self._ik_opspace(xyz, quat, q_init, max_iterations, dt,
+                                    pos_threshold, ori_threshold)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    # --- mink ---------------------------------------------------------
+
+    def _ik_mink(self, xyz, quat, q_init, max_iters, dt,
+                 pos_tol, ori_tol):
         if q_init is not None:
-            self.configuration.q[:7] = q_init
+            self.configuration.q[:7] = np.asarray(q_init, dtype=np.float64)[:7]
 
-        # Convert quaternion [w, x, y, z] to rotation matrix
-        quat_scipy = np.array([quat[1], quat[2], quat[3], quat[0]])  # Convert to [x, y, z, w]
-        rot = R.from_quat(quat_scipy)
-        rot_mat = rot.as_matrix()
+        rot_mat = _quat_wxyz_to_matrix(quat)
+        target = self._mink.SE3.from_rotation_and_translation(
+            self._mink.SO3.from_matrix(rot_mat), xyz)
+        self.end_task.set_target(target)
 
-        # Create SE3 target pose
-        target_pose = mink.SE3.from_rotation_and_translation(
-            mink.SO3.from_matrix(rot_mat),
-            xyz
-        )
-
-        # Set IK task target
-        self.end_task.set_target(target_pose)
-
-        # Create tasks dictionary
-        tasks = {"eef": self.end_task, "posture": self.posture_task}
-
-        # Solve IK with convergence checking
-        for i in range(max_iterations):
-            # Compute IK velocity
-            vel = mink.solve_ik(
-                self.configuration,
-                tasks.values(),
-                dt,
-                self.ik_solver,
-                damping=self.damping
-            )
-
-            # Integrate velocity
+        tasks = (self.end_task, self.posture_task)
+        for _ in range(max_iters):
+            vel = self._mink.solve_ik(
+                self.configuration, tasks, dt,
+                self._mink_ik_solver, damping=self._mink_damping)
             self.configuration.integrate_inplace(vel, dt)
-
-            # Check convergence using task error
             err = self.end_task.compute_error(self.configuration)
-            pos_achieved = np.linalg.norm(err[:3]) <= pos_threshold
-            ori_achieved = np.linalg.norm(err[3:]) <= ori_threshold
-
-            if pos_achieved and ori_achieved:
+            if (np.linalg.norm(err[:3]) <= pos_tol
+                    and np.linalg.norm(err[3:]) <= ori_tol):
                 return self.configuration.q[:7].copy(), True
-
-        # Did not converge within max iterations
         return self.configuration.q[:7].copy(), False
 
-    def get_joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Get joint limits from the model.
+    # --- damped least-squares (env.py port) --------------------------
 
-        Returns:
-            q_min: Lower joint limits [7,]
-            q_max: Upper joint limits [7,]
-        """
-        q_min = self.model.jnt_range[:7, 0].copy()
-        q_max = self.model.jnt_range[:7, 1].copy()
-        return q_min, q_max
+    def _ik_dls(self, xyz, quat, q_init, max_iters, pos_tol, ori_tol):
+        # Levenberg-Marquardt with a damped pseudo-inverse:
+        #   dq = J^T (J J^T + λ²I)^-1 e
+        # Per-iter step clamps keep the linearization valid even when the
+        # target is far from the current pose.
+        if q_init is not None:
+            q = np.asarray(q_init, dtype=np.float64)[:7].copy()
+        else:
+            q = self.data.qpos[self._qpos_adr].copy()
 
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+        err = np.zeros(6)
 
+        for _ in range(max_iters):
+            self.data.qpos[self._qpos_adr] = q
+            mujoco.mj_kinematics(self.model, self.data)
+            mujoco.mj_comPos(self.model, self.data)
+
+            cur_xyz = self.data.xpos[self.end_body_id].copy()
+            cur_quat = self.data.xquat[self.end_body_id].copy()
+            err[:3] = xyz - cur_xyz
+            inv_cur = np.zeros(4)
+            mujoco.mju_negQuat(inv_cur, cur_quat)
+            err_q = np.zeros(4)
+            mujoco.mju_mulQuat(err_q, quat, inv_cur)
+            mujoco.mju_quat2Vel(err[3:], err_q, 1.0)
+
+            pos_err = np.linalg.norm(err[:3])
+            rot_err = np.linalg.norm(err[3:])
+            if pos_err < pos_tol and rot_err < ori_tol:
+                return q, True
+
+            if pos_err > self._dls_pos_step_max:
+                err[:3] *= self._dls_pos_step_max / pos_err
+            if rot_err > self._dls_rot_step_max:
+                err[3:] *= self._dls_rot_step_max / rot_err
+
+            mujoco.mj_jacBody(self.model, self.data, jacp, jacr,
+                              self.end_body_id)
+            J = np.vstack([jacp[:, self._qvel_adr],
+                           jacr[:, self._qvel_adr]])
+            JJt = J @ J.T + (self._dls_damping ** 2) * np.eye(6)
+            try:
+                dq = J.T @ np.linalg.solve(JJt, err)
+            except np.linalg.LinAlgError:
+                break
+            q = q + dq
+
+        # Final FK to settle data.qpos
+        self.data.qpos[self._qpos_adr] = q
+        mujoco.mj_kinematics(self.model, self.data)
+        return q, False
+
+    # --- opspace wrapper ---------------------------------------------
+
+    def _ik_opspace(self, xyz, quat, q_init, max_iters, dt,
+                    pos_tol, ori_tol):
+        # opspace returns torques. Bypass the model's actuators by
+        # writing torque into qfrc_applied, then mj_step advances
+        # dynamics. We track pose error per step and break on
+        # convergence. Velocity is reset between calls so opspace
+        # doesn't pick up leftover momentum from a previous IK.
+        if q_init is not None:
+            self.data.qpos[self._qpos_adr] = np.asarray(q_init,
+                                                        dtype=np.float64)[:7]
+        self.data.qvel[self._qvel_adr] = 0.0
+        # Also zero out any leftover applied force / actuator ctrl so
+        # only our opspace torque drives the dynamics.
+        self.data.qfrc_applied[:] = 0.0
+        self.data.ctrl[:] = 0.0
+
+        dof_ids = self._qvel_adr
+        for _ in range(max_iters):
+            mujoco.mj_forward(self.model, self.data)
+
+            cur_xyz = self.data.site_xpos[self.end_site_id].copy()
+            cur_xmat = self.data.site_xmat[self.end_site_id].reshape(3, 3)
+            cur_quat = _xmat_to_quat_wxyz(cur_xmat)
+
+            pos_err = np.linalg.norm(xyz - cur_xyz)
+            # Orientation error via mujoco quat math (matches DLS path).
+            err_q = np.zeros(4)
+            inv_cur = np.zeros(4)
+            mujoco.mju_negQuat(inv_cur, cur_quat)
+            mujoco.mju_mulQuat(err_q, quat, inv_cur)
+            err_rot = np.zeros(3)
+            mujoco.mju_quat2Vel(err_rot, err_q, 1.0)
+            rot_err = np.linalg.norm(err_rot)
+            if pos_err < pos_tol and rot_err < ori_tol:
+                return self.data.qpos[self._qpos_adr].copy(), True
+
+            tau = self._opspace_torque(
+                self.end_site_id, dof_ids,
+                pos_des=xyz, quat_des=quat,
+                pos_gains=self._ops_pos_gains,
+                ori_gains=self._ops_ori_gains,
+                damping_ratio=self._ops_damping_ratio,
+                nullspace_stiffness=self._ops_nullspace_stiffness,
+                gravity_comp=True,
+            )
+            self.data.qfrc_applied[dof_ids] = tau
+            mujoco.mj_step(self.model, self.data)
+
+        return self.data.qpos[self._qpos_adr].copy(), False
+
+    # ------------------------------------------------------------------
+    # Inlined opspace torque controller (port of dexjoco/sim/controllers/
+    # opspace.opspace, with dm_robotics.transformations swapped out for
+    # mujoco's built-in quat ops). Returns generalized force τ for the
+    # arm DOFs that drives the site pose toward (pos_des, quat_des) via
+    # task-space PD with a nullspace posture term.
+    # ------------------------------------------------------------------
+
+    def _opspace_torque(
+        self,
+        site_id: int,
+        dof_ids: np.ndarray,
+        pos_des: np.ndarray,
+        quat_des: np.ndarray,
+        joint_des: Optional[np.ndarray] = None,
+        pos_gains=(200.0, 200.0, 200.0),
+        ori_gains=(200.0, 200.0, 200.0),
+        damping_ratio: float = 1.0,
+        nullspace_stiffness: float = 0.5,
+        max_pos_acceleration: Optional[float] = None,
+        max_ori_acceleration: Optional[float] = None,
+        gravity_comp: bool = True,
+    ) -> np.ndarray:
+        model, data = self.model, self.data
+
+        x_des = np.asarray(pos_des, dtype=np.float64).reshape(3)
+        q_des_quat = np.asarray(quat_des, dtype=np.float64).reshape(4)
+
+        if joint_des is None:
+            q_des = data.qpos[dof_ids].copy()
+        else:
+            q_des = np.asarray(joint_des, dtype=np.float64)
+
+        kp_pos = np.asarray(pos_gains, dtype=np.float64)
+        kd_pos = damping_ratio * 2.0 * np.sqrt(kp_pos)
+        kp_ori = np.asarray(ori_gains, dtype=np.float64)
+        kd_ori = damping_ratio * 2.0 * np.sqrt(kp_ori)
+        kp_joint = np.full((len(dof_ids),), nullspace_stiffness)
+        kd_joint = damping_ratio * 2.0 * np.sqrt(kp_joint)
+
+        ddx_max = (max_pos_acceleration
+                   if max_pos_acceleration is not None else 0.0)
+        dw_max = (max_ori_acceleration
+                  if max_ori_acceleration is not None else 0.0)
+
+        q = data.qpos[dof_ids]
+        dq = data.qvel[dof_ids]
+
+        # Jacobian of the eef site (translational + rotational), restricted
+        # to the arm DOFs.
+        J_v = np.zeros((3, model.nv), dtype=np.float64)
+        J_w = np.zeros((3, model.nv), dtype=np.float64)
+        mujoco.mj_jacSite(model, data, J_v, J_w, site_id)
+        J_v = J_v[:, dof_ids]
+        J_w = J_w[:, dof_ids]
+        J = np.concatenate([J_v, J_w], axis=0)
+
+        # ---- position PD ------------------------------------------------
+        x = data.site_xpos[site_id]
+        dx = J_v @ dq
+        x_err = x - x_des
+        if ddx_max > 0.0:
+            x_err_sq = np.sum(x_err ** 2)
+            if x_err_sq > ddx_max ** 2:
+                x_err *= ddx_max / np.sqrt(x_err_sq)
+        ddx = -kp_pos * x_err - kd_pos * dx
+
+        # ---- orientation PD --------------------------------------------
+        # current quat from site xmat (mujoco scalar-first convention)
+        xmat = data.site_xmat[site_id].reshape(3, 3)
+        cur_quat = np.zeros(4)
+        mujoco.mju_mat2Quat(cur_quat, xmat.reshape(9))
+        # Double-cover handling: pick the shortest-path representative.
+        if np.dot(cur_quat, q_des_quat) < 0.0:
+            cur_quat = -cur_quat
+        # quat_err = cur * inv(des)  (active difference: rotation from des to cur)
+        inv_des = np.zeros(4)
+        mujoco.mju_negQuat(inv_des, q_des_quat)
+        quat_err = np.zeros(4)
+        mujoco.mju_mulQuat(quat_err, cur_quat, inv_des)
+        ori_err = np.zeros(3)
+        mujoco.mju_quat2Vel(ori_err, quat_err, 1.0)  # axis-angle vec
+        if dw_max > 0.0:
+            ori_err_sq = np.sum(ori_err ** 2)
+            if ori_err_sq > dw_max ** 2:
+                ori_err *= dw_max / np.sqrt(ori_err_sq)
+        w = J_w @ dq
+        dw = -kp_ori * ori_err - kd_ori * w
+
+        # ---- task-space inertia ----------------------------------------
+        M = np.zeros((model.nv, model.nv), dtype=np.float64)
+        mujoco.mj_fullM(model, M, data.qM)
+        M = M[dof_ids, :][:, dof_ids]
+        M_inv = np.linalg.inv(M)
+        Mx_inv = J @ M_inv @ J.T
+        if abs(np.linalg.det(Mx_inv)) >= 1e-2:
+            Mx = np.linalg.inv(Mx_inv)
+        else:
+            Mx = np.linalg.pinv(Mx_inv, rcond=1e-2)
+
+        ddx_dw = np.concatenate([ddx, dw], axis=0)
+        tau = J.T @ Mx @ ddx_dw
+
+        # ---- nullspace joint task --------------------------------------
+        ddq = -kp_joint * (q - q_des) - kd_joint * dq
+        Jnull = M_inv @ J.T @ Mx
+        tau += (np.eye(len(q)) - J.T @ Jnull.T) @ ddq
+
+        if gravity_comp:
+            tau += data.qfrc_bias[dof_ids]
+        return tau
