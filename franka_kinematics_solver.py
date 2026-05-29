@@ -1,8 +1,8 @@
 """
-Franka FR3 FK/IK solver with pluggable IK backends.
+FK/IK solver with pluggable IK backends.
 
-Three backends share one ``(xyz, quat[w,x,y,z]) -> q[7]`` IK interface and
-one ``q[7] -> (xyz, quat[w,x,y,z])`` FK interface:
+Three backends share one ``(xyz, quat[w,x,y,z]) -> q[N]`` IK interface and
+one ``q[N] -> (xyz, quat[w,x,y,z])`` FK interface:
 
 * ``mink``    — mink's QP-based IK with a FrameTask + PostureTask.
 * ``dls``     — damped least-squares (Levenberg-Marquardt), ported from
@@ -11,13 +11,22 @@ one ``q[7] -> (xyz, quat[w,x,y,z])`` FK interface:
                 running its torque output into a scratch ``MjData`` via
                 ``qfrc_applied`` + ``mj_step`` until pose error settles.
 
+The solver was originally Franka-only (qpos[:7] hardcoded). It now accepts
+an optional ``RobotProfile`` that names the arm joints by string, so a
+generalised robot whose arm lives deep inside a chassis/torso chain
+(e.g. astribot_s1_fixed_sharpa: chassis → 4 torso joints → 7 arm joints)
+can use the same IK plumbing. Old call sites that pass only ``model_path``
+fall back to the legacy 7-DoF arange(7) behaviour byte-identical to the
+pre-profile version.
+
 Backend imports are lazy: only the chosen backend's third-party module
 needs to be installed. ``mujoco`` is always required.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import numpy as np
 import mujoco
@@ -36,21 +45,62 @@ def _quat_wxyz_to_matrix(quat_wxyz: np.ndarray) -> np.ndarray:
     return R.from_quat(quat_xyzw).as_matrix()
 
 
+@dataclass
+class RobotProfile:
+    """Per-robot kinematics descriptor consumed by ``FrankaKinematicsSolver``.
+
+    The legacy code assumed a standalone Franka MJCF where the first seven
+    hinge joints ARE the arm — so ``qpos[:7]`` indexed the arm subspace
+    directly. For a robot whose arm joints live inside a larger chain
+    (chassis / torso / head also use qpos slots) this is wrong; we instead
+    resolve qpos / qvel addresses from named joints.
+
+    Attributes
+    ----------
+    xml_path
+        MJCF to load. May be a standalone arm (legacy) or a full assembly.
+    end_site_name
+        Site whose pose the IK targets. For Franka the standalone XML names
+        it ``end``; an assembly might use ``arm_left_tool``.
+    arm_joint_names
+        Ordered list of N joint names the IK actuates. When None, falls back
+        to ``arange(7)`` (legacy Franka behaviour).
+    posture_freeze_joints
+        Mink-only: joint names whose PostureTask cost is boosted high so
+        mink doesn't accidentally drive them. Used for non-arm DoFs in an
+        assembly XML (torso, head, chassis) that you want to pin to their
+        initial pose during arm IK. Other backends ignore this.
+    """
+
+    xml_path: str
+    end_site_name: str = "end"
+    arm_joint_names: Optional[List[str]] = None
+    posture_freeze_joints: Optional[List[str]] = field(default_factory=list)
+
+
 class FrankaKinematicsSolver:
-    """FK/IK wrapper around a standalone Franka MJCF, with multi-backend IK.
+    """FK/IK wrapper around an MJCF, with multi-backend IK.
 
     The solver owns one ``MjModel`` / ``MjData`` pair. FK and IK both
     operate on that scratch data, so consecutive IK calls warm-start
     against the previous solution unless ``q_init`` is passed explicitly.
+
+    Accepts either the legacy ``(model_path, end_site_name="end")`` constructor
+    args (which synthesise a 7-DoF arange profile — byte-identical to the
+    pre-profile behaviour) OR a keyword-only ``profile=RobotProfile(...)`` for
+    robots whose arm lives inside a larger chain. Both forms coexist so the
+    existing FR3v2 call sites in DexSimBench need no edits.
     """
 
     SUPPORTED = ("mink", "dls", "opspace")
 
     def __init__(
         self,
-        model_path: str,
+        model_path: Optional[str] = None,
         end_site_name: str = "end",
         solver: str = "mink",
+        *,
+        profile: Optional[RobotProfile] = None,
         **solver_kwargs,
     ):
         if solver not in self.SUPPORTED:
@@ -58,26 +108,65 @@ class FrankaKinematicsSolver:
                 f"Unknown solver '{solver}'. Supported: {self.SUPPORTED}"
             )
 
-        self.model_path = model_path
-        self.end_site_name = end_site_name
+        # Synthesise a legacy 7-DoF profile from positional args when no
+        # profile was supplied. This is the back-compat shim — all three
+        # historical DexSimBench call sites (env.py:566, data_collect_sim.py:131,
+        # replay_episode.py:284) take this branch.
+        if profile is None:
+            if model_path is None:
+                raise ValueError(
+                    "Either model_path (legacy) or profile=RobotProfile(...) "
+                    "must be supplied"
+                )
+            profile = RobotProfile(xml_path=model_path,
+                                   end_site_name=end_site_name)
+        self.profile = profile
+        self.model_path = profile.xml_path
+        self.end_site_name = profile.end_site_name
         self.solver = solver
 
-        self.model = mujoco.MjModel.from_xml_path(model_path)
+        self.model = mujoco.MjModel.from_xml_path(self.model_path)
         self.data = mujoco.MjData(self.model)
 
         self.end_site_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_SITE, end_site_name
+            self.model, mujoco.mjtObj.mjOBJ_SITE, self.end_site_name
         )
         if self.end_site_id < 0:
-            raise ValueError(f"Site '{end_site_name}' not found in model")
+            raise ValueError(
+                f"Site '{self.end_site_name}' not found in {self.model_path}"
+            )
         self.end_body_id = int(self.model.site_bodyid[self.end_site_id])
 
-        # 7-DOF arm assumption: first seven hinge joints drive the arm.
-        # The standalone fr3v2 MJCF used by this solver has exactly seven
-        # 1-DOF joints in the kinematic chain, so qpos[:7] / qvel[:7] is
-        # the arm subspace.
-        self._qpos_adr = np.arange(7, dtype=int)
-        self._qvel_adr = np.arange(7, dtype=int)
+        # Arm qpos / qvel slots. Legacy: first 7 hinges. Profile: derived
+        # from joint names so an arm buried under torso/chassis joints
+        # still indexes correctly.
+        if profile.arm_joint_names:
+            jids = []
+            for n in profile.arm_joint_names:
+                jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, n)
+                if jid < 0:
+                    raise ValueError(
+                        f"Joint '{n}' not found in {self.model_path}"
+                    )
+                jids.append(jid)
+            self._qpos_adr = np.array(
+                [int(self.model.jnt_qposadr[j]) for j in jids], dtype=int)
+            self._qvel_adr = np.array(
+                [int(self.model.jnt_dofadr[j]) for j in jids], dtype=int)
+            self._joint_ids = np.asarray(jids, dtype=int)
+        else:
+            self._qpos_adr = np.arange(7, dtype=int)
+            self._qvel_adr = np.arange(7, dtype=int)
+            self._joint_ids = np.arange(7, dtype=int)
+        self._n_arm = int(self._qpos_adr.size)
+
+        # Posture-freeze joints (mink only). Pre-resolve ids so the mink
+        # init can bias the posture task accordingly.
+        self._freeze_joint_ids: List[int] = []
+        for n in (profile.posture_freeze_joints or []):
+            jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, n)
+            if jid >= 0:
+                self._freeze_joint_ids.append(jid)
 
         # Backend-specific setup
         if solver == "mink":
@@ -145,9 +234,9 @@ class FrankaKinematicsSolver:
     # ------------------------------------------------------------------
 
     def forward_kinematics(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Site "end" pose as ``(xyz, quat=[w, x, y, z])`` for joints ``q``."""
+        """End-site pose as ``(xyz, quat=[w, x, y, z])`` for arm joints ``q``."""
         q = np.asarray(q, dtype=np.float64).reshape(-1)
-        self.data.qpos[self._qpos_adr] = q[:7]
+        self.data.qpos[self._qpos_adr] = q[:self._n_arm]
         mujoco.mj_forward(self.model, self.data)
         xyz = self.data.site_xpos[self.end_site_id].copy()
         xmat = self.data.site_xmat[self.end_site_id].reshape(3, 3).copy()
@@ -155,8 +244,12 @@ class FrankaKinematicsSolver:
         return xyz, quat
 
     def get_joint_limits(self) -> Tuple[np.ndarray, np.ndarray]:
-        return (self.model.jnt_range[:7, 0].copy(),
-                self.model.jnt_range[:7, 1].copy())
+        # Resolve range from the actual arm joints (not jnt_range[:7]) so
+        # an assembly XML where the arm starts at jnt_index>0 returns the
+        # right limits.
+        lo = self.model.jnt_range[self._joint_ids, 0].copy()
+        hi = self.model.jnt_range[self._joint_ids, 1].copy()
+        return lo, hi
 
     # ------------------------------------------------------------------
     # Inverse kinematics (dispatch)
@@ -202,7 +295,8 @@ class FrankaKinematicsSolver:
     def _ik_mink(self, xyz, quat, q_init, max_iters, dt,
                  pos_tol, ori_tol):
         if q_init is not None:
-            self.configuration.q[:7] = np.asarray(q_init, dtype=np.float64)[:7]
+            self.configuration.q[self._qpos_adr] = (
+                np.asarray(q_init, dtype=np.float64)[:self._n_arm])
 
         rot_mat = _quat_wxyz_to_matrix(quat)
         target = self._mink.SE3.from_rotation_and_translation(
@@ -218,8 +312,8 @@ class FrankaKinematicsSolver:
             err = self.end_task.compute_error(self.configuration)
             if (np.linalg.norm(err[:3]) <= pos_tol
                     and np.linalg.norm(err[3:]) <= ori_tol):
-                return self.configuration.q[:7].copy(), True
-        return self.configuration.q[:7].copy(), False
+                return self.configuration.q[self._qpos_adr].copy(), True
+        return self.configuration.q[self._qpos_adr].copy(), False
 
     # --- damped least-squares (env.py port) --------------------------
 
@@ -229,7 +323,7 @@ class FrankaKinematicsSolver:
         # Per-iter step clamps keep the linearization valid even when the
         # target is far from the current pose.
         if q_init is not None:
-            q = np.asarray(q_init, dtype=np.float64)[:7].copy()
+            q = np.asarray(q_init, dtype=np.float64)[:self._n_arm].copy()
         else:
             q = self.data.qpos[self._qpos_adr].copy()
 
@@ -288,7 +382,7 @@ class FrankaKinematicsSolver:
         # doesn't pick up leftover momentum from a previous IK.
         if q_init is not None:
             self.data.qpos[self._qpos_adr] = np.asarray(q_init,
-                                                        dtype=np.float64)[:7]
+                                                        dtype=np.float64)[:self._n_arm]
         self.data.qvel[self._qvel_adr] = 0.0
         # Also zero out any leftover applied force / actuator ctrl so
         # only our opspace torque drives the dynamics.
@@ -440,3 +534,9 @@ class FrankaKinematicsSolver:
         if gravity_comp:
             tau += data.qfrc_bias[dof_ids]
         return tau
+
+
+# Neutral alias so callers writing new code can import a robot-agnostic name.
+# Keeps existing `from franka_kinematics_solver import FrankaKinematicsSolver`
+# imports working.
+KinematicsSolver = FrankaKinematicsSolver
