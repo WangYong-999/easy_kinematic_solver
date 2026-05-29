@@ -70,12 +70,20 @@ class RobotProfile:
         mink doesn't accidentally drive them. Used for non-arm DoFs in an
         assembly XML (torso, head, chassis) that you want to pin to their
         initial pose during arm IK. Other backends ignore this.
+    base_body_name
+        ``humanoid_arm`` solver only. Name of the body whose LOCAL frame
+        the IK target lives in (and which FK rebases against). For
+        standalone single-arm MJCFs this is typically ``"base"`` /
+        ``"link0"``; for a full-assembly XML this is the chassis the arms
+        branch off of (``"chassis_base"`` for astribot). Other backends
+        ignore this — they consume targets in the IK model's WORLD frame.
     """
 
     xml_path: str
     end_site_name: str = "end"
     arm_joint_names: Optional[List[str]] = None
     posture_freeze_joints: Optional[List[str]] = field(default_factory=list)
+    base_body_name: Optional[str] = None
 
 
 class FrankaKinematicsSolver:
@@ -92,7 +100,7 @@ class FrankaKinematicsSolver:
     existing FR3v2 call sites in DexSimBench need no edits.
     """
 
-    SUPPORTED = ("mink", "dls", "opspace")
+    SUPPORTED = ("mink", "dls", "opspace", "humanoid_arm")
 
     def __init__(
         self,
@@ -175,6 +183,8 @@ class FrankaKinematicsSolver:
             self._init_dls(**solver_kwargs)
         elif solver == "opspace":
             self._init_opspace(**solver_kwargs)
+        elif solver == "humanoid_arm":
+            self._init_humanoid_arm(**solver_kwargs)
 
     # ------------------------------------------------------------------
     # Backend init
@@ -288,6 +298,9 @@ class FrankaKinematicsSolver:
         if self.solver == "opspace":
             return self._ik_opspace(xyz, quat, q_init, max_iterations, dt,
                                     pos_threshold, ori_threshold)
+        if self.solver == "humanoid_arm":
+            return self._ik_humanoid_arm(xyz, quat, q_init, max_iterations,
+                                         pos_threshold, ori_threshold)
         raise AssertionError("unreachable")  # pragma: no cover
 
     # --- mink ---------------------------------------------------------
@@ -534,6 +547,181 @@ class FrankaKinematicsSolver:
         if gravity_comp:
             tau += data.qfrc_bias[dof_ids]
         return tau
+
+    # ------------------------------------------------------------------
+    # humanoid_arm — SLSQP port of humanoid-arm-retarget/arms_retarget.py
+    # ------------------------------------------------------------------
+    #
+    # Differs from mink/dls/opspace in two important ways:
+    #
+    #   1. **Target frame is the BASE BODY LOCAL frame**, not the IK
+    #      model's world. The reference repo (config_fftai_gr1.yaml) and
+    #      its `_objective_function` both operate in per-arm-base
+    #      coordinates: VR-world wrist is first transformed via
+    #      `left_base @ wrist @ left_wrist` into the robot's left arm
+    #      base frame, then handed to the optimizer; the FK function
+    #      `left_fk(q)` also returns the EE in that same base frame, so
+    #      the comparison is apples-to-apples.
+    #
+    #      To replicate without robot-specific analytic FK we let
+    #      MuJoCo do the FK on the loaded MJCF and then rebase from IK
+    #      world to the body named in `profile.base_body_name`. The
+    #      body's pose is STATIC in the IK model (it has no joints
+    #      between itself and worldbody), so we cache it once at init.
+    #
+    #   2. **Cost function is the reference's `_fi`-shaped scalar
+    #      objective**: `60 * pos_cost + 6 * ori_cost + 2 * vel_cost`
+    #      where `_fi(n=1, s=0, c=0.2, r=5)(x) = -exp(-x^2/0.08) +
+    #      5 x^4`. The exp pulls hard toward x=0; the x^4 keeps SLSQP
+    #      from running away into unreachable joint configurations.
+    #      We collapse the reference's 5-up + 2-wrist split into a
+    #      single 7-DoF SLSQP because (a) MuJoCo FK already handles
+    #      the wrist axes naturally and (b) without a per-robot
+    #      analytic forearm-vector function the analytic split would
+    #      need an AVP-side hint we don't have on the IK channel.
+
+    def _init_humanoid_arm(self,
+                           pos_weight: float = 60.0,
+                           ori_weight: float = 6.0,
+                           vel_weight: float = 2.0,
+                           fi_c: float = 0.2,
+                           fi_r: float = 5.0,
+                           shoulder_weight: float = 2.0,
+                           tol: float = 1e-3,
+                           **_unused):
+        # Resolve base body whose LOCAL frame holds the IK target.
+        # Fall back to the first non-world body (the assembly's root) so
+        # standalone arm MJCFs without an explicit `base` body still work.
+        bname = self.profile.base_body_name
+        bid = -1
+        if bname:
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, bname)
+        if bid < 0:
+            # nbody=1 is worldbody itself; bid=1 is the first real body.
+            if self.model.nbody >= 2:
+                bid = 1
+        if bid < 0:
+            raise ValueError(
+                f"humanoid_arm solver could not locate a base body "
+                f"(profile.base_body_name={bname!r}) in {self.model_path}"
+            )
+        self._ha_base_body_id = bid
+        # Cache the body's static pose in IK world. body_pos / body_quat
+        # are the XML-declared offsets relative to the parent (worldbody
+        # for our case), so for a worldbody child these ARE the IK-world
+        # pose.
+        self._ha_base_xyz = np.asarray(self.model.body_pos[bid],
+                                       dtype=np.float64).copy()
+        self._ha_base_quat = np.asarray(self.model.body_quat[bid],
+                                        dtype=np.float64).copy()
+        # Pre-build the rotation matrix to skip repeated quat→mat conv.
+        self._ha_base_R = _quat_wxyz_to_matrix(self._ha_base_quat)
+
+        # Optimizer state — bounds from MJCF joint ranges, warm-start.
+        lo, hi = self.get_joint_limits()
+        self._ha_bounds = list(zip(lo.tolist(), hi.tolist()))
+        self._ha_last_q = None  # warm-start across calls
+        self._ha_pos_w = float(pos_weight)
+        self._ha_ori_w = float(ori_weight)
+        self._ha_vel_w = float(vel_weight)
+        self._ha_fi_c = float(fi_c)
+        self._ha_fi_r = float(fi_r)
+        self._ha_shoulder_w = float(shoulder_weight)
+        self._ha_tol = float(tol)
+
+    @staticmethod
+    def _ha_fi(c: float, r: float, x: float) -> float:
+        # Reference `_fi(n=1, s=0, c, r)`: minus-gaussian + quartic, so
+        # the global minimum sits at x=0 and the quartic wall keeps the
+        # optimizer from straying into unreachable regions.
+        return -np.exp(-(x * x) / (2.0 * c * c)) + r * (x ** 4)
+
+    def _ha_fk_in_base_local(self, q_arm: np.ndarray
+                             ) -> Tuple[np.ndarray, np.ndarray]:
+        """MuJoCo FK → end-site pose in base body LOCAL frame."""
+        self.data.qpos[self._qpos_adr] = q_arm
+        mujoco.mj_kinematics(self.model, self.data)
+        site_xyz_world = self.data.site_xpos[self.end_site_id]
+        site_xmat_world = self.data.site_xmat[self.end_site_id].reshape(3, 3)
+        # base^T * (site_world - base_pos)
+        xyz_local = self._ha_base_R.T @ (site_xyz_world - self._ha_base_xyz)
+        mat_local = self._ha_base_R.T @ site_xmat_world
+        return xyz_local, mat_local
+
+    def _ha_objective(self, q_arm: np.ndarray,
+                      target_xyz: np.ndarray,
+                      target_mat: np.ndarray,
+                      q_prev: np.ndarray) -> float:
+        actual_xyz, actual_mat = self._ha_fk_in_base_local(q_arm)
+        pos_err = float(np.linalg.norm(target_xyz - actual_xyz))
+        # angular distance via trace identity:
+        # angle = acos( (trace(R_target^T R_actual) - 1) / 2 )
+        R_rel = target_mat.T @ actual_mat
+        cos_ang = (np.trace(R_rel) - 1.0) * 0.5
+        cos_ang = max(-1.0, min(1.0, cos_ang))
+        ori_err = float(np.arccos(cos_ang))
+        # Joint-velocity cost: shoulder joints weighted higher so SLSQP
+        # doesn't spin them gratuitously when a wrist-only rotation
+        # would suffice — same `shoulder_weight=2.0` boost the
+        # reference applies to its q[0:3].
+        dq = q_arm - q_prev
+        if len(dq) >= 3:
+            dq = dq.copy()
+            dq[:3] *= self._ha_shoulder_w
+        vel_err = float(np.linalg.norm(dq))
+        c, r = self._ha_fi_c, self._ha_fi_r
+        return (self._ha_pos_w * self._ha_fi(c, r, pos_err)
+                + self._ha_ori_w * self._ha_fi(c, r, ori_err)
+                + self._ha_vel_w * self._ha_fi(c, r, vel_err))
+
+    def _ik_humanoid_arm(self, xyz, quat, q_init, max_iters,
+                         pos_tol, ori_tol):
+        # Target is in BASE LOCAL frame (caller's responsibility — see
+        # the class docstring for why this differs from mink/dls/opspace).
+        import scipy.optimize as opt  # lazy import: scipy needed only here
+
+        target_xyz = np.asarray(xyz, dtype=np.float64).reshape(3)
+        target_mat = _quat_wxyz_to_matrix(np.asarray(quat, dtype=np.float64))
+
+        # Warm start: prefer caller-supplied q_init, then the previous
+        # call's solution, then the current scratch qpos.
+        if q_init is not None:
+            q0 = np.asarray(q_init, dtype=np.float64)[:self._n_arm].copy()
+        elif self._ha_last_q is not None:
+            q0 = self._ha_last_q.copy()
+        else:
+            q0 = self.data.qpos[self._qpos_adr].copy()
+        # Clip seed into bounds — SLSQP otherwise complains on the first
+        # iteration if the warm-start sits outside the box.
+        for i, (lo, hi) in enumerate(self._ha_bounds):
+            q0[i] = min(max(q0[i], lo), hi)
+
+        q_prev = (self._ha_last_q.copy() if self._ha_last_q is not None
+                  else q0.copy())
+
+        result = opt.minimize(
+            self._ha_objective,
+            q0,
+            args=(target_xyz, target_mat, q_prev),
+            method="SLSQP",
+            tol=self._ha_tol,
+            bounds=self._ha_bounds,
+            options={"maxiter": int(max_iters)},
+        )
+        q_sol = np.asarray(result.x, dtype=np.float64)
+        # Convergence check via actual residuals — SLSQP's success flag
+        # reports gradient/step-size convergence which is too lax for
+        # our pose tolerance contract.
+        actual_xyz, actual_mat = self._ha_fk_in_base_local(q_sol)
+        pos_err = float(np.linalg.norm(target_xyz - actual_xyz))
+        R_rel = target_mat.T @ actual_mat
+        cos_ang = max(-1.0, min(1.0, (np.trace(R_rel) - 1.0) * 0.5))
+        ori_err = float(np.arccos(cos_ang))
+        ok = (pos_err <= pos_tol and ori_err <= ori_tol)
+        # Cache for warm start regardless of convergence — even a
+        # near-miss solution is a useful seed for the next AVP frame.
+        self._ha_last_q = q_sol
+        return q_sol, ok
 
 
 # Neutral alias so callers writing new code can import a robot-agnostic name.
